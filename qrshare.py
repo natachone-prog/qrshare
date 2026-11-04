@@ -447,6 +447,7 @@ def main():
         sys.exit("ไม่พบพอร์ตว่าง")
     port = server.server_address[1]
     Handler.state = State(folder, f"http://{lan_ip()}:{port}")
+    log(f"เริ่มทำงาน {Handler.state.url.split('?')[0]} โฟลเดอร์ {folder}")
     host_url = f"http://127.0.0.1:{port}/host"
     print("QRShare กำลังทำงาน")
     print(f"  หน้าจอ QR code: {host_url}")
@@ -462,5 +463,42 @@ def main():
     print("หยุดโปรแกรมแล้ว")
 
 
+def log_path():
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    if sys.platform == "darwin" and ".app/" in base:
+        base = os.path.expanduser("~")  # ไม่เขียนลงใน .app
+    return os.path.join(base, "QRShare-log.txt")
+
+
+def log(msg):
+    try:
+        with open(log_path(), "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+    except OSError:
+        pass
+
+
+def show_error(msg):
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, msg, "QRShare", 0x10)
+            return
+        except Exception:
+            pass
+    elif sys.platform == "darwin" and getattr(sys, "frozen", False):
+        subprocess.run(["osascript", "-e", f'display alert "QRShare" message {json.dumps(msg)}'], check=False)
+        return
+    print(msg, file=sys.stderr or sys.__stderr__)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        log("เกิดข้อผิดพลาด:\n" + traceback.format_exc())
+        show_error(f"QRShare เกิดข้อผิดพลาดและต้องปิดตัว\nรายละเอียดอยู่ในไฟล์ {log_path()}\n\n{sys.exc_info()[1]}")
+        sys.exit(1)

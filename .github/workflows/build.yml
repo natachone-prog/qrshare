@@ -38,6 +38,22 @@ jobs:
         run: |
           pyinstaller --windowed --name QRShare --osx-bundle-identifier com.qrshare.app qrshare.py
           ditto -c -k --keepParent dist/QRShare.app ${{ matrix.asset }}
+      - name: Smoke test Windows exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist/QRShare.exe -ArgumentList "--no-browser" -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { Get-Content dist/QRShare-log.txt -ErrorAction SilentlyContinue; throw "exe exited with code $($p.ExitCode)" }
+          Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/host/state | Select-Object -ExpandProperty Content
+          Stop-Process -Id $p.Id
+      - name: Smoke test Mac app
+        if: runner.os == 'macOS'
+        run: |
+          dist/QRShare.app/Contents/MacOS/QRShare --no-browser &
+          sleep 15
+          curl -sf http://127.0.0.1:8765/host/state || { cat ~/QRShare-log.txt; exit 1; }
+          kill %1
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}

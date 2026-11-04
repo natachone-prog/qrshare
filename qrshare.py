@@ -6,6 +6,7 @@
 import argparse
 import html
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -52,6 +53,12 @@ class State:
         self.fails = 0
         self.sessions = set()
         self.received = []  # [(เวลา, ชื่อไฟล์, ขนาด)]
+        self.show_event = threading.Event()  # มีคนเปิดโปรแกรมซ้ำ ให้เด้งหน้าต่างขึ้นมา
+        self.quit_event = threading.Event()
+
+    def set_folder(self, folder):
+        with self.lock:
+            self.folder = folder
 
     @staticmethod
     def _new_pin():
@@ -88,6 +95,21 @@ def unique_path(folder, name):
         path = os.path.join(folder, f"{base} ({n}){ext}")
         n += 1
     return path
+
+
+KINDS = {
+    "image": "jpg jpeg png gif webp heic heif bmp",
+    "video": "mp4 mov m4v avi mkv webm 3gp",
+    "audio": "mp3 m4a wav aac flac ogg",
+    "doc": "pdf doc docx xls xlsx ppt pptx txt csv rtf odt ods odp pages numbers key",
+    "archive": "zip rar 7z tar gz",
+}
+EXT_KIND = {ext: k for k, exts in KINDS.items() for ext in exts.split()}
+INLINE_OK = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}  # แสดงรูปย่อได้ (ไม่รวม svg เพื่อความปลอดภัย)
+
+
+def file_kind(name):
+    return EXT_KIND.get(os.path.splitext(name)[1][1:].lower(), "other")
 
 
 def list_files(folder):
@@ -140,6 +162,15 @@ def already_running(port):
         return False
 
 
+def post_local(port, path):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as c:
+            c.sendall(f"POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nX-QRShare: 1\r\nContent-Length: 0\r\n\r\n".encode())
+            c.recv(64)
+    except OSError:
+        pass
+
+
 def human_size(n):
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024 or unit == "GB":
@@ -175,7 +206,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_file(self, path, name):
+    def send_file(self, path, name, inline=False):
         size = os.path.getsize(path)
         start, end = 0, size - 1
         rng = self.headers.get("Range", "")
@@ -194,15 +225,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
         self.send_response(206 if partial else 200)
-        self.send_header("Content-Type", "application/octet-stream")
+        ctype = (mimetypes.guess_type(name)[0] if inline else None) or "application/octet-stream"
+        self.send_header("Content-Type", ctype)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         ascii_name = name.encode("ascii", "replace").decode().replace('"', "_").replace("?", "_")
         self.send_header("Content-Disposition",
-                         f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(name)}")
-        self.send_header("Cache-Control", "no-store")
+                         f"{'inline' if inline else 'attachment'}; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(name)}")
+        self.send_header("Cache-Control", "private, max-age=300" if inline else "no-store")
         self.end_headers()
         try:
             with open(path, "rb") as f:
@@ -241,7 +274,9 @@ class Handler(BaseHTTPRequestHandler):
             files = list_files(st.folder)
             for f in files:
                 f["sizeText"] = human_size(f["size"])
-                f["time"] = time.strftime("%d/%m/%Y %H:%M", time.localtime(f.pop("mtime")))
+                f["time"] = time.strftime("%d/%m/%Y %H:%M", time.localtime(f["mtime"]))
+                f["kind"] = file_kind(f["name"])
+                f["thumb"] = os.path.splitext(f["name"])[1][1:].lower() in INLINE_OK
             return self.send_json(200, {"files": files})
         if u.path == "/api/download":
             if not self.session_ok():
@@ -251,24 +286,29 @@ class Handler(BaseHTTPRequestHandler):
             path = resolve_download(st.folder, name)
             if not path:
                 return self.send(404, "ไม่พบไฟล์")
-            return self.send_file(path, name)
+            inline = "inline=1" in u.query and os.path.splitext(name)[1][1:].lower() in INLINE_OK
+            return self.send_file(path, name, inline)
         if u.path == "/":
             token = (q.get("t") or [""])[0]
             if self.session_ok() or secrets.compare_digest(token, st.token):
-                return self.send(200, PHONE_PAGE.replace("__TOKEN__", html.escape(token)))
+                page = PHONE_PAGE.replace("__TOKEN__", html.escape(token))
+                return self.send(200, page.replace("__AUTHED__", "true" if self.session_ok() else "false"))
             return self.send(403, NEED_QR_PAGE)
         self.send(404, "Not found")
 
     def do_POST(self):
-        if self.path in ("/host/open-folder", "/host/quit"):
+        if self.path in ("/host/open-folder", "/host/quit", "/host/show"):
             # ต้องมาจากเครื่องนี้ และมี header พิเศษ (กันเว็บอื่นสั่งผ่านเบราว์เซอร์)
             if not self.is_local() or self.headers.get("X-QRShare") != "1":
                 return self.send_json(403, {})
             if self.path == "/host/open-folder":
                 open_folder(self.state.folder)
                 return self.send_json(200, {"ok": True})
+            if self.path == "/host/show":
+                self.state.show_event.set()
+                return self.send_json(200, {"ok": True})
             self.send_json(200, {"ok": True})
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            self.state.quit_event.set()
             return
         if self.path != "/api/login":
             return self.send(404, "Not found")
@@ -373,7 +413,20 @@ PHONE_PAGE = f"""<!doctype html><html lang="th"><head><meta charset="utf-8"><met
 .tabs{{display:flex;gap:8px;margin-bottom:16px}}.tabs button{{background:var(--card);color:var(--text);border:1px solid var(--line);padding:10px 8px;font-size:15px}}
 .tabs button.on{{background:var(--accent);color:#fff;border-color:var(--accent)}}a{{color:var(--accent)}}
 .dl{{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line);text-decoration:none;color:var(--text)}}.dl:first-child{{border-top:0}}
-.dl .meta{{flex:1;min-width:0}}.dl .name{{word-break:break-all}}.dl .get{{color:var(--accent);font-weight:600;white-space:nowrap}}</style></head>
+.dl .meta{{flex:1;min-width:0}}.dl .name{{word-break:break-all}}.dl .get{{color:var(--accent);font-weight:600;white-space:nowrap}}
+.ic{{width:44px;height:44px;border-radius:8px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:22px;overflow:hidden;flex:none}}
+.ic img{{width:100%;height:100%;object-fit:cover}}
+.bar2{{display:flex;gap:8px;align-items:center;margin:10px 0}}.seg{{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;flex:none}}
+.seg button{{width:auto;border-radius:0;background:var(--card);color:var(--text);padding:8px 12px;font-size:14px}}.seg button.on{{background:var(--accent);color:#fff}}
+select,#q{{font:inherit;font-size:14px;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--text);min-width:0}}
+select{{flex:1}}#q{{width:100%;letter-spacing:0;text-align:left}}
+.chips{{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;margin-bottom:8px}}.chips button{{width:auto;flex:none;background:var(--bg);color:var(--text);border:1px solid var(--line);padding:6px 12px;font-size:13px;border-radius:999px}}
+.chips button.on{{background:var(--accent);color:#fff;border-color:var(--accent)}}
+#dl.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
+.tile{{display:block;text-decoration:none;color:var(--text);min-width:0}}.tile .th{{aspect-ratio:1;border-radius:10px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:34px;overflow:hidden;position:relative}}
+.tile .th img{{width:100%;height:100%;object-fit:cover}}.tile .ext{{position:absolute;bottom:4px;right:4px;font-size:10px;background:rgba(0,0,0,.55);color:#fff;padding:1px 5px;border-radius:4px}}
+.tile .nm{{font-size:12px;margin-top:4px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-all}}.tile .sz{{font-size:11px;color:var(--muted)}}
+</style></head>
 <body><div class="wrap">
 <div class="card"><h1>QRShare</h1><div class="muted">รับ–ส่งไฟล์กับคอมพิวเตอร์</div></div>
 <div class="card" id="login"><p style="margin-top:0">ใส่ PIN 6 หลักที่แสดงบนจอคอมพิวเตอร์</p>
@@ -383,20 +436,46 @@ PHONE_PAGE = f"""<!doctype html><html lang="th"><head><meta charset="utf-8"><met
 <div class="card" id="up"><input type="file" id="files" multiple hidden>
 <button id="pick">เลือกไฟล์เพื่อส่ง</button><div id="list" style="margin-top:12px"></div></div>
 <div class="card" id="down" hidden><div style="display:flex;justify-content:space-between;align-items:center"><b>ไฟล์ในคอมพิวเตอร์</b>
-<a href="#" id="refresh">รีเฟรช</a></div><div id="dl" style="margin-top:8px"></div></div></div>
+<a href="#" id="refresh">รีเฟรช</a></div>
+<div class="bar2"><div class="seg"><button data-v="list" class="on">☰ รายการ</button><button data-v="grid">▦ รูปย่อ</button></div>
+<select id="sort"><option value="new">ใหม่สุดก่อน</option><option value="old">เก่าสุดก่อน</option><option value="name">ชื่อ ก–ฮ / A–Z</option><option value="big">ไฟล์ใหญ่ก่อน</option><option value="small">ไฟล์เล็กก่อน</option></select></div>
+<div class="chips" id="chips"><button data-k="all" class="on">ทั้งหมด</button><button data-k="image">รูปภาพ</button><button data-k="video">วิดีโอ</button><button data-k="audio">เสียง</button><button data-k="doc">เอกสาร</button><button data-k="other">อื่น ๆ</button></div>
+<input id="q" type="search" placeholder="ค้นหาชื่อไฟล์">
+<div id="dl" style="margin-top:10px"></div></div></div>
 </div>
 <script>
-const T="__TOKEN__";const $=id=>document.getElementById(id);
+const T="__TOKEN__",AUTHED=__AUTHED__;const $=id=>document.getElementById(id);
 function showUpload(){{$('login').hidden=true;$('app').hidden=false;}}
+if(AUTHED)showUpload();
 function tab(down){{$('up').hidden=down;$('down').hidden=!down;$('tabUp').className=down?'':'on';$('tabDown').className=down?'on':'';if(down)loadFiles()}}
 $('tabUp').onclick=()=>tab(false);$('tabDown').onclick=()=>tab(true);$('refresh').onclick=e=>{{e.preventDefault();loadFiles()}};
-async function loadFiles(){{const box=$('dl');box.innerHTML='<div class="muted">กำลังโหลด…</div>';
+const ICON={{image:'🖼️',video:'🎬',audio:'🎵',doc:'📄',archive:'🗜️',other:'📦'}};
+let FILES=[];const pref={{view:'list',sort:'new',kind:'all'}};
+try{{Object.assign(pref,JSON.parse(localStorage.getItem('qrshare-pref')||'{{}}'))}}catch(e){{}}
+function savePref(){{try{{localStorage.setItem('qrshare-pref',JSON.stringify(pref))}}catch(e){{}}}}
+function syncControls(){{document.querySelectorAll('.seg button').forEach(b=>b.className=b.dataset.v===pref.view?'on':'');
+document.querySelectorAll('#chips button').forEach(b=>b.className=b.dataset.k===pref.kind?'on':'');$('sort').value=pref.sort}}
+document.querySelectorAll('.seg button').forEach(b=>b.onclick=()=>{{pref.view=b.dataset.v;savePref();syncControls();render()}});
+document.querySelectorAll('#chips button').forEach(b=>b.onclick=()=>{{pref.kind=b.dataset.k;savePref();syncControls();render()}});
+$('sort').onchange=()=>{{pref.sort=$('sort').value;savePref();render()}};$('q').oninput=render;syncControls();
+const url=(f,inline)=>'/api/download?name='+encodeURIComponent(f.name)+(inline?'&inline=1':'');
+function thumb(f,box){{if(f.thumb){{const i=document.createElement('img');i.loading='lazy';i.alt='';i.src=url(f,true);
+i.onerror=()=>{{i.remove();box.prepend(ICON[f.kind])}};box.prepend(i)}}else box.prepend(ICON[f.kind])}}
+function render(){{const box=$('dl'),q=$('q').value.trim().toLowerCase();
+let list=FILES.filter(f=>(pref.kind==='all'||(pref.kind==='other'?['other','archive'].includes(f.kind):f.kind===pref.kind))&&(!q||f.name.toLowerCase().includes(q)));
+const cmp={{new:(a,b)=>b.mtime-a.mtime,old:(a,b)=>a.mtime-b.mtime,name:(a,b)=>a.name.localeCompare(b.name,'th',{{numeric:true}}),big:(a,b)=>b.size-a.size,small:(a,b)=>a.size-b.size}}[pref.sort];
+list.sort(cmp);box.className=pref.view==='grid'?'grid':'';box.innerHTML='';
+if(!list.length){{box.className='';box.innerHTML='<div class="muted">'+(FILES.length?'ไม่พบไฟล์ที่ตรงกับเงื่อนไข':'ยังไม่มีไฟล์ในโฟลเดอร์')+'</div>';return}}
+for(const f of list){{const a=document.createElement('a');a.href=url(f);
+if(pref.view==='grid'){{a.className='tile';a.innerHTML='<div class="th"></div><div class="nm"></div><div class="sz"></div>';
+const th=a.querySelector('.th');thumb(f,th);if(!f.thumb){{const e=document.createElement('span');e.className='ext';e.textContent=(f.name.split('.').pop()||'').toUpperCase().slice(0,5);th.appendChild(e)}}
+a.querySelector('.nm').textContent=f.name;a.querySelector('.sz').textContent=f.sizeText}}
+else{{a.className='dl';a.innerHTML='<div class="ic"></div><div class="meta"><div class="name"></div><div class="st"></div></div><span class="get">ดาวน์โหลด</span>';
+thumb(f,a.querySelector('.ic'));a.querySelector('.name').textContent=f.name;a.querySelector('.st').textContent=f.sizeText+' · '+f.time}}
+box.appendChild(a)}}}}
+async function loadFiles(){{const box=$('dl');if(!FILES.length)box.innerHTML='<div class="muted">กำลังโหลด…</div>';
 try{{const r=await fetch('/api/files');if(r.status===401){{box.innerHTML='<div class="muted">หมดเวลาเข้าใช้งาน กรุณาสแกน QR ใหม่</div>';return}}
-const j=await r.json();box.innerHTML=j.files.length?'':'<div class="muted">ยังไม่มีไฟล์ในโฟลเดอร์</div>';
-for(const f of j.files){{const a=document.createElement('a');a.className='dl';a.href='/api/download?name='+encodeURIComponent(f.name);
-a.innerHTML='<div class="meta"><div class="name"></div><div class="st"></div></div><span class="get">ดาวน์โหลด</span>';
-a.querySelector('.name').textContent=f.name;a.querySelector('.st').textContent=f.sizeText+' · '+f.time;box.appendChild(a)}}
-}}catch(e){{box.innerHTML='<div class="muted">เชื่อมต่อคอมพิวเตอร์ไม่ได้</div>'}}}}
+FILES=(await r.json()).files;render()}}catch(e){{box.innerHTML='<div class="muted">เชื่อมต่อคอมพิวเตอร์ไม่ได้</div>'}}}}
 async function login(){{const pin=$('pin').value.trim();if(pin.length!==6){{$('err').textContent='PIN ต้องมี 6 หลัก';return}}
 $('go').disabled=true;$('err').textContent='';
 try{{const r=await fetch('/api/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{t:T,pin}})}});
@@ -422,20 +501,171 @@ for(let i=0;i<files.length;i++)await uploadOne(files[i],rows[i]);$('pick').disab
 </script></body></html>"""
 
 
+def settings_path():
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or home
+    elif sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return os.path.join(base, "QRShare", "settings.json")
+
+
+def load_settings():
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    try:
+        os.makedirs(os.path.dirname(settings_path()), exist_ok=True)
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        log(f"บันทึกการตั้งค่าไม่ได้: {e}")
+
+
+def folder_writable(folder):
+    try:
+        os.makedirs(folder, exist_ok=True)
+        test = os.path.join(folder, f".qrshare-test-{secrets.token_hex(4)}")
+        with open(test, "w") as f:
+            f.write("ok")
+        os.remove(test)
+        return True
+    except OSError:
+        return False
+
+
+def run_gui(st):
+    """หน้าต่างโปรแกรมบนคอมพิวเตอร์ (แทนการเปิดผ่านเบราว์เซอร์)"""
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    BG, CARD, TEXT, MUTED, ACCENT, LINE = "#f6f7f9", "#ffffff", "#1d2330", "#667085", "#2563eb", "#e4e7ec"
+    fam = "Leelawadee UI" if sys.platform.startswith("win") else ("Thonburi" if sys.platform == "darwin" else "TkDefaultFont")
+
+    def F(size, bold=False):
+        return (fam, size, "bold") if bold else (fam, size)
+
+    root = tk.Tk()
+    root.title("QRShare")
+    root.configure(bg=BG)
+    root.resizable(False, False)
+
+    def card(parent):
+        fr = tk.Frame(parent, bg=CARD, highlightbackground=LINE, highlightthickness=1, padx=16, pady=12)
+        fr.pack(fill="x", padx=16, pady=(0, 12))
+        return fr
+
+    def button(parent, text, cmd, primary=False):
+        return tk.Button(parent, text=text, command=cmd, font=F(10), relief="flat", cursor="hand2", padx=12, pady=4,
+                         bg=ACCENT if primary else BG, fg="#fff" if primary else TEXT,
+                         activebackground=ACCENT if primary else LINE, activeforeground="#fff" if primary else TEXT,
+                         highlightbackground=LINE, highlightthickness=0 if primary else 1, bd=0)
+
+    tk.Label(root, text="QRShare", font=F(18, True), bg=BG, fg=TEXT).pack(anchor="w", padx=16, pady=(14, 0))
+    tk.Label(root, text="สแกน QR code ด้วยกล้องมือถือ (ต่อ Wi‑Fi เดียวกับคอมพิวเตอร์)", font=F(10), bg=BG, fg=MUTED
+             ).pack(anchor="w", padx=16, pady=(0, 10))
+
+    c1 = card(root)
+    qr_png = segno.make(st.url, error="m").png_data_uri(scale=6, border=2).split(",", 1)[1]
+    qr_img = tk.PhotoImage(data=qr_png)
+    tk.Label(c1, image=qr_img, bg=CARD).pack()
+    tk.Label(c1, text="PIN สำหรับเข้าใช้งาน", font=F(10), bg=CARD, fg=MUTED).pack(pady=(8, 0))
+    pin_var = tk.StringVar(value=" ".join(st.pin))
+    tk.Label(c1, textvariable=pin_var, font=F(30, True), bg=CARD, fg=TEXT).pack()
+    tk.Label(c1, text=f"ใส่ PIN ผิด {MAX_PIN_TRIES} ครั้ง PIN จะเปลี่ยนใหม่อัตโนมัติ", font=F(9), bg=CARD, fg=MUTED).pack()
+
+    c2 = card(root)
+    tk.Label(c2, text="โฟลเดอร์แชร์", font=F(11, True), bg=CARD, fg=TEXT).pack(anchor="w")
+    tk.Label(c2, text="ไฟล์ที่ส่งมาจะเก็บที่นี่ และมือถือดาวน์โหลดไฟล์ในโฟลเดอร์นี้ได้", font=F(9), bg=CARD, fg=MUTED
+             ).pack(anchor="w")
+    folder_var = tk.StringVar(value=st.folder)
+    tk.Label(c2, textvariable=folder_var, font=F(10), bg=CARD, fg=TEXT, wraplength=360, justify="left").pack(anchor="w", pady=6)
+
+    def change_folder():
+        new = filedialog.askdirectory(parent=root, initialdir=st.folder, title="เลือกโฟลเดอร์แชร์")
+        if not new:
+            return
+        new = os.path.abspath(new)
+        if not folder_writable(new):
+            messagebox.showerror("QRShare", "บันทึกไฟล์ลงโฟลเดอร์นี้ไม่ได้ กรุณาเลือกโฟลเดอร์อื่น", parent=root)
+            return
+        st.set_folder(new)
+        folder_var.set(new)
+        settings = load_settings()
+        settings["folder"] = new
+        save_settings(settings)
+        log(f"เปลี่ยนโฟลเดอร์แชร์เป็น {new}")
+
+    row = tk.Frame(c2, bg=CARD)
+    row.pack(anchor="w")
+    button(row, "เปลี่ยนโฟลเดอร์…", change_folder, primary=True).pack(side="left")
+    button(row, "เปิดโฟลเดอร์", lambda: open_folder(st.folder)).pack(side="left", padx=8)
+
+    c3 = card(root)
+    tk.Label(c3, text="ไฟล์ที่ได้รับล่าสุด", font=F(11, True), bg=CARD, fg=TEXT).pack(anchor="w")
+    lb = tk.Listbox(c3, height=5, font=F(10), bg=CARD, fg=TEXT, relief="flat", highlightthickness=0,
+                    selectbackground=LINE, selectforeground=TEXT, activestyle="none")
+    lb.pack(fill="x", pady=(4, 0))
+    lb.insert("end", "ยังไม่มี")
+    tk.Label(root, text="ปิดหน้าต่างนี้เพื่อหยุดโปรแกรม", font=F(9), bg=BG, fg=MUTED).pack(pady=(0, 12))
+
+    seen = [0]
+
+    def poll():
+        with st.lock:
+            pin, rec = st.pin, list(st.received)
+        if pin_var.get() != " ".join(pin):
+            pin_var.set(" ".join(pin))
+        if len(rec) != seen[0]:
+            seen[0] = len(rec)
+            lb.delete(0, "end")
+            for t, n, size in reversed(rec[-50:]):
+                lb.insert("end", f"{t}   {n}   ({human_size(size)})")
+        if st.show_event.is_set():
+            st.show_event.clear()
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
+            root.after(300, lambda: root.attributes("-topmost", False))
+            root.focus_force()
+        if st.quit_event.is_set():
+            root.destroy()
+            return
+        root.after(700, poll)
+
+    root.after(700, poll)
+    root.mainloop()
+
+
 def main():
-    ap = argparse.ArgumentParser(description="QRShare: ส่งไฟล์จากมือถือเข้าคอมพิวเตอร์ผ่าน QR code")
-    ap.add_argument("--folder", default=default_folder(), help="โฟลเดอร์สำหรับเก็บไฟล์")
+    ap = argparse.ArgumentParser(description="QRShare: รับ-ส่งไฟล์ระหว่างมือถือกับคอมพิวเตอร์ผ่าน QR code")
+    ap.add_argument("--folder", help="โฟลเดอร์แชร์ (ถ้าไม่ระบุ ใช้ค่าที่เลือกไว้ล่าสุด)")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--no-browser", action="store_true", help="ไม่ต้องเปิดเบราว์เซอร์อัตโนมัติ")
+    ap.add_argument("--no-gui", "--no-browser", dest="no_gui", action="store_true",
+                    help="ไม่เปิดหน้าต่างโปรแกรม (ดูหน้า QR ได้ที่ http://127.0.0.1:พอร์ต/host)")
+    ap.add_argument("--browser", action="store_true", help="แสดง QR code ในเบราว์เซอร์แทนหน้าต่างโปรแกรม")
     a = ap.parse_args()
 
     if already_running(a.port):
-        print("QRShare เปิดอยู่แล้ว กำลังเปิดหน้าจอ QR code")
-        if not a.no_browser:
+        print("QRShare เปิดอยู่แล้ว")
+        if a.browser:
             webbrowser.open(f"http://127.0.0.1:{a.port}/host")
+        elif not a.no_gui:
+            post_local(a.port, "/host/show")
         return
-    folder = os.path.abspath(os.path.expanduser(a.folder))
-    os.makedirs(folder, exist_ok=True)
+    folder = a.folder or load_settings().get("folder") or default_folder()
+    folder = os.path.abspath(os.path.expanduser(folder))
+    if not folder_writable(folder):
+        log(f"ใช้โฟลเดอร์ {folder} ไม่ได้ กลับไปใช้ค่าเริ่มต้น")
+        folder = default_folder()
+        os.makedirs(folder, exist_ok=True)
     server = None
     for port in range(a.port, a.port + 20):
         try:
@@ -444,21 +674,27 @@ def main():
         except OSError:
             continue
     if server is None:
-        sys.exit("ไม่พบพอร์ตว่าง")
+        raise RuntimeError("ไม่พบพอร์ตว่างสำหรับเปิดโปรแกรม")
     port = server.server_address[1]
-    Handler.state = State(folder, f"http://{lan_ip()}:{port}")
-    log(f"เริ่มทำงาน {Handler.state.url.split('?')[0]} โฟลเดอร์ {folder}")
+    st = Handler.state = State(folder, f"http://{lan_ip()}:{port}")
+    log(f"เริ่มทำงาน {st.url.split('?')[0]} โฟลเดอร์ {folder}")
     host_url = f"http://127.0.0.1:{port}/host"
     print("QRShare กำลังทำงาน")
     print(f"  หน้าจอ QR code: {host_url}")
-    print(f"  โฟลเดอร์เก็บไฟล์: {folder}")
-    print("  กด Ctrl+C เพื่อหยุด")
-    if not a.no_browser:
-        threading.Timer(0.5, lambda: webbrowser.open(host_url)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    print(f"  โฟลเดอร์แชร์: {folder}")
+
+    if a.no_gui or a.browser:
+        if a.browser:
+            threading.Timer(0.5, lambda: webbrowser.open(host_url)).start()
+        threading.Thread(target=lambda: (st.quit_event.wait(), server.shutdown()), daemon=True).start()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    else:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        run_gui(st)
+        server.shutdown()
     server.server_close()
     print("หยุดโปรแกรมแล้ว")
 

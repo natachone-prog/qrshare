@@ -166,9 +166,9 @@ def post_local(port, path):
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=2) as c:
             c.sendall(f"POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nX-QRShare: 1\r\nContent-Length: 0\r\n\r\n".encode())
-            c.recv(64)
+            return b" 200 " in c.recv(64)
     except OSError:
-        pass
+        return False
 
 
 def human_size(n):
@@ -654,12 +654,19 @@ def main():
     a = ap.parse_args()
 
     if already_running(a.port):
-        print("QRShare เปิดอยู่แล้ว")
         if a.browser:
             webbrowser.open(f"http://127.0.0.1:{a.port}/host")
-        elif not a.no_gui:
-            post_local(a.port, "/host/show")
-        return
+            return
+        if a.no_gui or post_local(a.port, "/host/show"):
+            print("QRShare เปิดอยู่แล้ว")
+            return
+        # เป็น QRShare รุ่นเก่าที่ยังเปิดค้างอยู่ (ไม่มีหน้าต่าง) ปิดตัวเก่าแล้วเปิดรุ่นใหม่แทน
+        log("พบ QRShare รุ่นเก่าเปิดค้างอยู่ กำลังปิดแล้วเปิดรุ่นใหม่")
+        post_local(a.port, "/host/quit")
+        for _ in range(20):
+            time.sleep(0.25)
+            if not already_running(a.port):
+                break
     folder = a.folder or load_settings().get("folder") or default_folder()
     folder = os.path.abspath(os.path.expanduser(folder))
     if not folder_writable(folder):

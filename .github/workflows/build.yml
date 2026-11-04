@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: QRShare-Windows.zip
+          - os: macos-latest
+            asset: QRShare-Mac.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller==6.11.1
+      - name: Build Windows exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          pyinstaller --onefile --windowed --name QRShare qrshare.py
+          Compress-Archive -Path dist/QRShare.exe -DestinationPath ${{ matrix.asset }}
+      - name: Build Mac app
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --windowed --name QRShare --osx-bundle-identifier com.qrshare.app qrshare.py
+          ditto -c -k --keepParent dist/QRShare.app ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

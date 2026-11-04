@@ -46,25 +46,27 @@ jobs:
           Start-Sleep -Seconds 15
           if ($p.HasExited) { Get-Content dist/QRShare-log.txt -ErrorAction SilentlyContinue; throw "exe exited with code $($p.ExitCode)" }
           Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/host/state | Select-Object -ExpandProperty Content
-          Stop-Process -Id $p.Id
+          Invoke-WebRequest -UseBasicParsing -Method Post -Headers @{"X-QRShare"="1"} http://127.0.0.1:8765/host/quit | Out-Null
           Start-Sleep -Seconds 2
           $g = Start-Process -FilePath dist/QRShare.exe -PassThru
           Start-Sleep -Seconds 15
           if ($g.HasExited) { Get-Content dist/QRShare-log.txt -ErrorAction SilentlyContinue; throw "GUI exited with code $($g.ExitCode)" }
           Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/host/state | Select-Object -ExpandProperty Content
-          Stop-Process -Id $g.Id
+          Invoke-WebRequest -UseBasicParsing -Method Post -Headers @{"X-QRShare"="1"} http://127.0.0.1:8765/host/quit | Out-Null
+          Start-Sleep -Seconds 3
+          if (-not $g.HasExited) { throw "GUI did not quit" }
       - name: Smoke test Mac app
         if: runner.os == 'macOS'
         run: |
           dist/QRShare.app/Contents/MacOS/QRShare --no-browser &
           sleep 15
           curl -sf http://127.0.0.1:8765/host/state || { cat ~/QRShare-log.txt; exit 1; }
-          kill %1
+          curl -sf -X POST -H "X-QRShare: 1" http://127.0.0.1:8765/host/quit
           sleep 2
           dist/QRShare.app/Contents/MacOS/QRShare &
           sleep 15
           curl -sf http://127.0.0.1:8765/host/state || { cat ~/QRShare-log.txt; exit 1; }
-          kill %2
+          curl -sf -X POST -H "X-QRShare: 1" http://127.0.0.1:8765/host/quit
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
